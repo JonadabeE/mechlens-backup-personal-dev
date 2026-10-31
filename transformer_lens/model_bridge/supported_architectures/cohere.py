@@ -36,7 +36,9 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
     - CohereLayerNorm is true LayerNorm (mean-subtracting), NOT RMSNorm.
       It has a weight parameter but NO bias parameter.
     - Logit scale: CohereForCausalLM.forward multiplies logits by logit_scale
-      (default 0.0625 = 1/16). Folded into unembed.weight via preprocess_weights.
+      (default 0.0625 = 1/16). Folded into unembed.weight via preprocess_weights,
+      which also sets the HF module's runtime multiplier to 1.0 so the scale is
+      applied exactly once after process_weights / enable_compatibility_mode.
     - Rotary embeddings use repeat_interleave instead of cat-split (delegated to HF).
 
     Optional parameters (absent from state_dict by default):
@@ -92,7 +94,12 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
         # logit_scale is not a declared field on TransformerBridgeConfig; it is a
         # Cohere-specific dynamic attribute accessed later in preprocess_weights.
         _ls = getattr(cfg, "logit_scale", None)
-        self.cfg.logit_scale = float(_ls) if _ls is not None else 0.0625  # type: ignore[attr-defined]
+        setattr(self.cfg, "logit_scale", float(_ls) if _ls is not None else 0.0625)
+
+        # Live HF model (set in prepare_model). preprocess_weights needs it to turn
+        # off HF's runtime logit multiply once the scale has been folded into W_U.
+        self._hf_model: Any = None
+        self._logit_scale_folded = False
 
         # --- RoPE theta (informational metadata) ---
         # CohereRotaryEmbedding reads config.rope_parameters["rope_theta"] directly;
@@ -158,19 +165,36 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
             "unembed": UnembeddingBridge(name="lm_head", config=self.cfg),
         }
 
+    def prepare_model(self, hf_model: Any) -> None:
+        """Keep a handle on the live HF model so the logit_scale fold can disable
+        CohereForCausalLM's own ``logits * self.logit_scale`` afterwards."""
+        self._hf_model = hf_model
+
     def preprocess_weights(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Fold logit_scale into unembed weights before ProcessWeights runs.
 
-        bridge.py lines 726-732 clone unembed.weight before calling this, so
-        scaling does not affect the tied embed.weight.
-        logit_scale=1.0 is a no-op (skipped for efficiency).
+        The Bridge always forwards through the HF model, and CohereForCausalLM.forward
+        multiplies ``lm_head`` output by ``self.logit_scale``. Folding the scale into
+        W_U therefore has to be paired with setting the HF module's runtime multiplier
+        to 1.0, or the processed model applies the scale twice (16x too small at the
+        default 1/16). W_U keeps the scale so logit-lens / DLA stay HT-equivalent.
+
+        bridge.process_weights clones unembed.weight before calling this, so the
+        fold does not leak into the tied embed.weight. The fold runs once: a second
+        process_weights call (e.g. enable_compatibility_mode after process_weights)
+        would otherwise re-scale already-scaled weights.
         """
         scale: float = getattr(self.cfg, "logit_scale")  # always set by __init__
+        if self._logit_scale_folded:
+            return state_dict
         if scale != 1.0:
             for key in ("unembed.weight", "unembed.bias"):
                 if key in state_dict:
                     orig_dtype = state_dict[key].dtype
                     state_dict[key] = (state_dict[key].float() * scale).to(orig_dtype)
+        if self._hf_model is not None and hasattr(self._hf_model, "logit_scale"):
+            self._hf_model.logit_scale = 1.0
+        self._logit_scale_folded = True
         return state_dict
 
     def setup_component_testing(self, hf_model: Any, bridge_model: Any = None) -> None:

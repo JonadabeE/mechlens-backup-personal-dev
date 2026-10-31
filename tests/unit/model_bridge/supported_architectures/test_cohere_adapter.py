@@ -319,8 +319,11 @@ class TestCohereAdapterWeightConversions:
         assert adapter.weight_processing_conversions is not None
         assert len(adapter.weight_processing_conversions) == 4
 
+        conversions = adapter.weight_processing_conversions
+        assert conversions is not None
+
         def _n(key: str) -> int:
-            conv = adapter.weight_processing_conversions[key]  # type: ignore[index]
+            conv = conversions[key]
             assert isinstance(conv, ParamProcessingConversion)
             assert isinstance(conv.tensor_conversion, RearrangeTensorConversion)
             return int(conv.tensor_conversion.axes_lengths["n"])
@@ -412,6 +415,71 @@ class TestCoherePreprocessWeights:
         sd = {"unembed.weight": torch.ones(100, 64, dtype=torch.float16)}
         sd = adapter.preprocess_weights(sd)
         assert sd["unembed.weight"].dtype == torch.float16
+
+
+class _FakeCohereForCausalLM(torch.nn.Module):
+    """Stand-in for HF CohereForCausalLM: carries the runtime logit multiplier."""
+
+    def __init__(self, logit_scale: float) -> None:
+        super().__init__()
+        self.logit_scale = logit_scale
+
+
+class TestCohereLogitScaleAppliedOnce:
+    """After the fold, HF's runtime ``logits * logit_scale`` must become a no-op.
+
+    The Bridge forwards through CohereForCausalLM.forward even after
+    process_weights, so without this the scale is applied twice (W_U fold + HF
+    multiply) and compat-mode logits come out 16x too small at the default 1/16.
+    """
+
+    def test_hf_runtime_multiplier_disabled_after_fold(self) -> None:
+        cfg = _make_cfg(logit_scale=0.125)
+        adapter = CohereArchitectureAdapter(cfg)
+        hf = _FakeCohereForCausalLM(logit_scale=0.125)
+        adapter.prepare_model(hf)
+        sd = {"unembed.weight": torch.ones(100, 64)}
+        sd = adapter.preprocess_weights(sd)
+        # Scale lives in W_U ...
+        assert torch.allclose(sd["unembed.weight"], torch.full((100, 64), 0.125))
+        # ... and nowhere else.
+        assert hf.logit_scale == 1.0
+
+    def test_cfg_logit_scale_untouched_by_fold(self) -> None:
+        # cfg.logit_scale documents the model; only the HF module attr is neutralized.
+        cfg = _make_cfg(logit_scale=0.125)
+        adapter = CohereArchitectureAdapter(cfg)
+        adapter.prepare_model(_FakeCohereForCausalLM(logit_scale=0.125))
+        adapter.preprocess_weights({"unembed.weight": torch.ones(100, 64)})
+        assert getattr(adapter.cfg, "logit_scale") == pytest.approx(0.125)
+
+    def test_fold_is_idempotent(self) -> None:
+        # enable_compatibility_mode after process_weights calls preprocess_weights
+        # again on already-scaled weights; the second call must not re-scale.
+        cfg = _make_cfg(logit_scale=0.5)
+        adapter = CohereArchitectureAdapter(cfg)
+        adapter.prepare_model(_FakeCohereForCausalLM(logit_scale=0.5))
+        sd = adapter.preprocess_weights({"unembed.weight": torch.ones(100, 64)})
+        sd = adapter.preprocess_weights(sd)
+        assert torch.allclose(sd["unembed.weight"], torch.full((100, 64), 0.5))
+
+    def test_fold_without_hf_model_still_scales(self) -> None:
+        # No prepare_model (e.g. synthetic cfg): the weight fold alone must still work.
+        cfg = _make_cfg(logit_scale=0.5)
+        adapter = CohereArchitectureAdapter(cfg)
+        sd = adapter.preprocess_weights({"unembed.weight": torch.ones(100, 64)})
+        assert torch.allclose(sd["unembed.weight"], torch.full((100, 64), 0.5))
+
+    def test_logit_scale_one_still_disables_hf_multiplier(self) -> None:
+        # cfg.logit_scale is the single source of truth: with 1.0 the weights stay
+        # raw, and the HF multiplier is switched off so the scale is applied once (as 1).
+        cfg = _make_cfg(logit_scale=1.0)
+        adapter = CohereArchitectureAdapter(cfg)
+        hf = _FakeCohereForCausalLM(logit_scale=0.125)
+        adapter.prepare_model(hf)
+        sd = adapter.preprocess_weights({"unembed.weight": torch.ones(100, 64)})
+        assert torch.allclose(sd["unembed.weight"], torch.ones(100, 64))
+        assert hf.logit_scale == 1.0
 
 
 class TestCohereArchitectureGuards:

@@ -28,21 +28,16 @@ from transformer_lens.model_bridge.generalized_components.position_embeddings_at
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
 
 
-@pytest.fixture(scope="module")
-def cohere_bridge():
-    """Load tiny Cohere bridge once per module (no weight processing)."""
-    return TransformerBridge.boot_transformers(MODEL, device="cpu")
+_BOOT_KWARGS: dict[str, Any] = {
+    "device": "cpu",
+    "dtype": torch.float32,
+    "attn_implementation": "eager",
+}
 
 
-@pytest.fixture(scope="module")
-def cohere_bridge_processed():
-    """Bridge with preprocess_weights applied (fold only, no centering).
-
-    process_weights must be called explicitly — boot_transformers does not call
-    it automatically. We disable all ProcessWeights options so only the adapter's
-    preprocess_weights (logit_scale fold + untie) runs.
-    """
-    bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
+def _fold_only_process_weights(bridge: TransformerBridge) -> None:
+    """process_weights with every ProcessWeights option off: only the adapter's
+    preprocess_weights (logit_scale fold + untie) runs."""
     bridge.process_weights(
         fold_ln=False,
         center_writing_weights=False,
@@ -50,13 +45,40 @@ def cohere_bridge_processed():
         fold_value_biases=False,
         refactor_factored_attn_matrices=False,
     )
+
+
+@pytest.fixture(scope="module")
+def cohere_bridge():
+    """Load tiny Cohere bridge once per module (no weight processing)."""
+    return TransformerBridge.boot_transformers(MODEL, **_BOOT_KWARGS)
+
+
+@pytest.fixture(scope="module")
+def cohere_bridge_processed():
+    """Bridge with preprocess_weights applied (fold only, no centering).
+
+    process_weights must be called explicitly — boot_transformers does not call
+    it automatically.
+    """
+    bridge = TransformerBridge.boot_transformers(MODEL, **_BOOT_KWARGS)
+    _fold_only_process_weights(bridge)
+    return bridge
+
+
+@pytest.fixture(scope="module")
+def cohere_bridge_compat():
+    """Bridge in full compatibility mode (fold_ln + centering, HT-equivalent)."""
+    bridge = TransformerBridge.boot_transformers(MODEL, **_BOOT_KWARGS)
+    bridge.enable_compatibility_mode(disable_warnings=True)
     return bridge
 
 
 @pytest.fixture(scope="module")
 def cohere_hf() -> Any:
     """Load the raw HF model for side-by-side comparisons."""
-    return AutoModelForCausalLM.from_pretrained(MODEL).eval()
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float32, attn_implementation="eager"
+    ).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -191,22 +213,66 @@ class TestCohereLogitScaleEndToEnd:
             f"logit_scale={logit_scale}"
         )
 
-    def test_logit_scale_folded_not_applied_twice(
+    def test_unprocessed_bridge_leaves_hf_multiplier_alone(
         self, cohere_bridge: TransformerBridge, cohere_hf: Any
     ) -> None:
-        """Confirm logit_scale isn't double-applied.
+        # Before process_weights nothing is folded, so HF's own multiply must stay live.
+        assert cohere_bridge.original_model.logit_scale == cohere_hf.config.logit_scale
 
-        The bridge (before process_weights) delegates to HF's forward, which includes
-        the logit_scale multiply. If forward still matches HF, the fold hasn't been
-        applied a second time on top of HF's own scale.
+    def test_processed_bridge_disables_hf_runtime_multiplier(
+        self, cohere_bridge_processed: TransformerBridge
+    ) -> None:
+        # The scale now lives in W_U; CohereForCausalLM.forward must multiply by 1.
+        assert cohere_bridge_processed.original_model.logit_scale == 1.0
+
+    def test_logit_scale_folded_not_applied_twice(
+        self, cohere_bridge_processed: TransformerBridge, cohere_hf: Any
+    ) -> None:
+        """Regression: after the fold, forward must still match HF.
+
+        The bridge forwards through CohereForCausalLM.forward, which multiplies by
+        ``self.logit_scale``. With the scale already folded into W_U, a live HF
+        multiplier would scale logits twice (0.125^2 here) and trip this assertion.
         """
         tokens = torch.tensor([[1, 2, 3, 4]])
         with torch.no_grad():
-            bridge_out = cohere_bridge(tokens)
+            bridge_out = cohere_bridge_processed(tokens)
             hf_out = cohere_hf(tokens).logits
-        # If logit_scale were applied twice, outputs would differ by a factor of 16
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 1e-4, f"Possible double-application of logit_scale; diff={max_diff:.6f}"
+        assert max_diff < 1e-4, f"logit_scale applied twice after fold; diff={max_diff:.6f}"
+
+    def test_compat_mode_forward_matches_hf(
+        self, cohere_bridge_compat: TransformerBridge, cohere_hf: Any
+    ) -> None:
+        """Full compatibility mode (fold_ln + centering) must preserve HF logits.
+
+        Centering the unembed shifts logits by a per-position constant, which
+        leaves log-probs unchanged, so compare log-softmax rather than raw logits.
+        """
+        tokens = torch.tensor([[1, 2, 3, 4]])
+        with torch.no_grad():
+            bridge_lp = torch.log_softmax(cohere_bridge_compat(tokens), dim=-1)
+            hf_lp = torch.log_softmax(cohere_hf(tokens).logits, dim=-1)
+        max_diff = (bridge_lp - hf_lp).abs().max().item()
+        assert max_diff < 1e-3, f"Compat-mode log-probs diverge from HF: max_diff={max_diff:.6f}"
+
+    def test_process_weights_twice_does_not_rescale(self, cohere_hf: Any) -> None:
+        # enable_compatibility_mode after an explicit process_weights re-enters
+        # preprocess_weights; W_U must carry logit_scale exactly once.
+        bridge = TransformerBridge.boot_transformers(MODEL, **_BOOT_KWARGS)
+        _fold_only_process_weights(bridge)
+        bridge.enable_compatibility_mode(
+            disable_warnings=True,
+            fold_ln=False,
+            center_writing_weights=False,
+            center_unembed=False,
+            fold_value_biases=False,
+        )
+        logit_scale = getattr(bridge.cfg, "logit_scale")
+        tl_weight = bridge.unembed.original_component.weight
+        expected = cohere_hf.lm_head.weight.detach() * logit_scale
+        max_diff = (tl_weight - expected).abs().max().item()
+        assert max_diff < 1e-5, f"W_U scaled more than once: max_diff={max_diff:.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -241,15 +307,9 @@ class TestCohereTiedEmbedding:
         #
         # cfg.logit_scale is set before process_weights so the fold (which reads it
         # inside preprocess_weights) runs with the parametrized value.
-        bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
-        bridge.cfg.logit_scale = logit_scale  # type: ignore[attr-defined]
-        bridge.process_weights(
-            fold_ln=False,
-            center_writing_weights=False,
-            center_unembed=False,
-            fold_value_biases=False,
-            refactor_factored_attn_matrices=False,
-        )
+        bridge = TransformerBridge.boot_transformers(MODEL, **_BOOT_KWARGS)
+        setattr(bridge.cfg, "logit_scale", logit_scale)
+        _fold_only_process_weights(bridge)
         tl_embed = bridge.embed.W_E
         tl_unembed = bridge.unembed.original_component.weight
         weights_identical = torch.allclose(tl_embed, tl_unembed)
