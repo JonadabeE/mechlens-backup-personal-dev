@@ -338,15 +338,22 @@ Required test classes (one per concern; copy-rename from a sibling):
 | `Test<Arch>HookShapes` | Hook fires; output shape matches expectation (replace with `ParallelHooks` / `MoEHooks` etc. for architecture-specific block shapes) |
 | `Test<Arch><Quirk>` | One class per architectural quirk: `LogitScale`, `RMSNormOffset`, `Softcap`, `TiedEmbedding`, etc. — each propagated config attr should have a test asserting `bridge.cfg.<attr> == hf_model.config.<attr>` |
 
-The boot fixture uses `dtype=` (Bridge's API), NOT `torch_dtype=` (HF's):
+The boot fixture uses `dtype=` (Bridge's API), NOT `torch_dtype=` (HF's). Do not pass `attn_implementation=` — `boot_transformers` has no such parameter (it raises `TypeError`) and already loads the HF model with eager attention; pass it only to the raw HF `from_pretrained` reference load:
 
 ```python
 @pytest.fixture(scope="module")
 def bridge():
-    return TransformerBridge.boot_transformers(
-        "<hf_repo>", device="cpu", dtype=torch.float32, attn_implementation="eager",
-    )
+    return TransformerBridge.boot_transformers("<hf_repo>", device="cpu", dtype=torch.float32)
+
+
+@pytest.fixture(scope="module")
+def hf_model():
+    return AutoModelForCausalLM.from_pretrained(
+        "<hf_repo>", torch_dtype=torch.float32, attn_implementation="eager"
+    ).eval()
 ```
+
+To cover a config variant the cached checkpoint lacks (e.g. Cohere `use_qk_norm=True`), build it from the cached config with seeded random init and boot with `hf_model=copy.deepcopy(ref), tokenizer=...` — no extra download, no mocking. See `TestCohereQKNorm` in [`test_cohere_adapter.py`](../../../tests/integration/model_bridge/test_cohere_adapter.py).
 
 If the reference model OOMs CI, gate with `@pytest.mark.skipif(bool(os.getenv("CI")), ...)` and add a row to [`QUARANTINES.md`](../../../tests/QUARANTINES.md) under "CI cost / network budget."
 

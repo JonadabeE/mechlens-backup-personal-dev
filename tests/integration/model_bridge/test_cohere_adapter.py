@@ -13,11 +13,12 @@ CohereAttention.forward directly), so functional correctness for that path relie
 on the same delegation mechanism verified in test_forward_matches_hf.
 """
 
+import copy
 from typing import Any
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from transformer_lens.model_bridge.bridge import TransformerBridge
 from transformer_lens.model_bridge.generalized_components import NormalizationBridge
@@ -28,11 +29,8 @@ from transformer_lens.model_bridge.generalized_components.position_embeddings_at
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
 
 
-_BOOT_KWARGS: dict[str, Any] = {
-    "device": "cpu",
-    "dtype": torch.float32,
-    "attn_implementation": "eager",
-}
+# boot_transformers loads the HF model with attn_implementation="eager" itself.
+_BOOT_KWARGS: dict[str, Any] = {"device": "cpu", "dtype": torch.float32}
 
 
 def _fold_only_process_weights(bridge: TransformerBridge) -> None:
@@ -392,3 +390,178 @@ class TestCohereParallelHooks:
         for i in range(2):
             assert f"blocks.{i}.hook_resid_pre" in cache
             assert f"blocks.{i}.hook_resid_post" in cache
+
+
+# ---------------------------------------------------------------------------
+# 7. Tokenizer policy — the adapter hardcodes default_prepend_bos=True on the
+#    strength of runtime behaviour, not tokenizer_config.json. Pin that claim.
+# ---------------------------------------------------------------------------
+
+
+class TestCohereTokenizerPolicy:
+    """default_prepend_bos=True must agree with what the tokenizer actually does."""
+
+    def test_tokenizer_prepends_bos_at_runtime(self, cohere_bridge: TransformerBridge) -> None:
+        tok = cohere_bridge.tokenizer
+        assert tok is not None
+        ids = tok("hello").input_ids
+        assert ids[0] == tok.bos_token_id, "CohereTokenizerFast no longer prepends BOS"
+
+    def test_cfg_bos_flags_match_runtime(self, cohere_bridge: TransformerBridge) -> None:
+        assert cohere_bridge.cfg.default_prepend_bos is True
+        assert cohere_bridge.cfg.tokenizer_prepends_bos is True
+
+
+# ---------------------------------------------------------------------------
+# 8. Processed-weight edits reach the forward pass (mirrors the verify_models
+#    Phase 3 "weight_modification" check that was failing for this model).
+# ---------------------------------------------------------------------------
+
+
+class TestCohereWeightModificationPropagates:
+    """In compatibility mode, editing TL-facing weights must change the loss."""
+
+    TOKENS = torch.tensor([[5, 17, 42, 99, 7, 3, 25, 11]])
+
+    def test_zeroing_w_v_head_changes_loss(self, cohere_bridge_compat: TransformerBridge) -> None:
+        bridge = cohere_bridge_compat
+        attn = bridge.blocks[0].attn
+        with torch.no_grad():
+            base = bridge(self.TOKENS, return_type="loss").item()
+            # W_V is a view onto v_proj.weight; an in-place zero must reach HF's forward.
+            w_v = attn.W_V
+            saved = w_v.clone()
+            w_v[0] = 0
+            modified = bridge(self.TOKENS, return_type="loss").item()
+            w_v.copy_(saved)
+            restored = bridge(self.TOKENS, return_type="loss").item()
+        assert abs(modified - base) > 1e-6, "Zeroing W_V head 0 did not change the loss"
+        assert abs(restored - base) < 1e-6, "Restoring W_V did not restore the loss"
+
+    def test_zeroing_mlp_out_row_changes_loss(
+        self, cohere_bridge_compat: TransformerBridge
+    ) -> None:
+        bridge = cohere_bridge_compat
+        out_w = bridge.blocks[0].mlp.out.weight
+        with torch.no_grad():
+            base = bridge(self.TOKENS, return_type="loss").item()
+            saved = out_w.clone()
+            out_w[0, :] = 0
+            modified = bridge(self.TOKENS, return_type="loss").item()
+            out_w.copy_(saved)
+        assert abs(modified - base) > 1e-6, "Zeroing an MLP output row did not change the loss"
+
+
+# ---------------------------------------------------------------------------
+# 9. HT-facing W_U carries logit_scale — this is what logit lens / DLA read.
+# ---------------------------------------------------------------------------
+
+
+class TestCohereUnembedView:
+    def test_w_u_is_scaled_hf_lm_head(
+        self, cohere_bridge_processed: TransformerBridge, cohere_hf: Any
+    ) -> None:
+        logit_scale = getattr(cohere_bridge_processed.cfg, "logit_scale")
+        w_u = cohere_bridge_processed.unembed.W_U  # [d_model, d_vocab]
+        expected = cohere_hf.lm_head.weight.detach().T * logit_scale
+        assert w_u.shape == expected.shape
+        max_diff = (w_u - expected).abs().max().item()
+        assert max_diff < 1e-5, f"W_U does not equal HF lm_head.T * logit_scale: {max_diff:.6f}"
+
+    def test_w_u_unscaled_before_processing(
+        self, cohere_bridge: TransformerBridge, cohere_hf: Any
+    ) -> None:
+        # Raw bridge: W_U is HF's raw lm_head; the scale is still applied by HF at runtime.
+        w_u = cohere_bridge.unembed.W_U
+        expected = cohere_hf.lm_head.weight.detach().T
+        max_diff = (w_u - expected).abs().max().item()
+        assert max_diff < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 10. QK-norm — canonical Command-R ships use_qk_norm=True; the tiny test
+#     checkpoint has it off. Build the variant from the cached config so the
+#     path is covered without a gated download.
+# ---------------------------------------------------------------------------
+
+
+def _make_qk_norm_reference() -> Any:
+    """Tiny CohereForCausalLM with use_qk_norm=True, seeded random init, eager attention."""
+    config = AutoConfig.from_pretrained(MODEL)
+    config.use_qk_norm = True
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_config(config, attn_implementation="eager")
+    return model.float().eval()
+
+
+@pytest.fixture(scope="module")
+def qk_norm_hf() -> Any:
+    """Reference HF model, never touched by the bridge."""
+    return _make_qk_norm_reference()
+
+
+@pytest.fixture(scope="module")
+def qk_norm_tokenizer() -> Any:
+    return AutoTokenizer.from_pretrained(MODEL)
+
+
+@pytest.fixture(scope="module")
+def qk_norm_bridge(qk_norm_hf: Any, qk_norm_tokenizer: Any) -> TransformerBridge:
+    """Raw bridge over a deep copy of the reference (bridge boot mutates its model)."""
+    return TransformerBridge.boot_transformers(
+        MODEL, hf_model=copy.deepcopy(qk_norm_hf), tokenizer=qk_norm_tokenizer, **_BOOT_KWARGS
+    )
+
+
+@pytest.fixture(scope="module")
+def qk_norm_bridge_compat(qk_norm_hf: Any, qk_norm_tokenizer: Any) -> TransformerBridge:
+    """Compatibility-mode bridge over another deep copy of the reference."""
+    bridge = TransformerBridge.boot_transformers(
+        MODEL, hf_model=copy.deepcopy(qk_norm_hf), tokenizer=qk_norm_tokenizer, **_BOOT_KWARGS
+    )
+    bridge.enable_compatibility_mode(disable_warnings=True)
+    return bridge
+
+
+class TestCohereQKNorm:
+    """use_qk_norm=True is HF-delegated inside CohereAttention; verify that delegation
+    survives both the raw path and compatibility-mode weight processing."""
+
+    TOKENS = torch.tensor([[1, 2, 3, 4, 5, 6]])
+
+    def test_reference_has_qk_norm(self, qk_norm_hf: Any) -> None:
+        assert qk_norm_hf.config.use_qk_norm is True
+        assert hasattr(qk_norm_hf.model.layers[0].self_attn, "q_norm")
+
+    def test_bridge_attn_delegates_to_qk_norm_module(
+        self, qk_norm_bridge: TransformerBridge
+    ) -> None:
+        attn = qk_norm_bridge.blocks[0].attn
+        assert isinstance(attn, PositionEmbeddingsAttentionBridge)
+        assert hasattr(attn.original_component, "q_norm")
+        assert hasattr(attn.original_component, "k_norm")
+
+    def test_raw_forward_matches_hf(
+        self, qk_norm_bridge: TransformerBridge, qk_norm_hf: Any
+    ) -> None:
+        with torch.no_grad():
+            bridge_out = qk_norm_bridge(self.TOKENS)
+            hf_out = qk_norm_hf(self.TOKENS).logits
+        max_diff = (bridge_out - hf_out).abs().max().item()
+        assert max_diff < 1e-4, f"QK-norm raw forward diverges from HF: {max_diff:.6f}"
+
+    def test_compat_mode_log_probs_match_hf(
+        self, qk_norm_bridge_compat: TransformerBridge, qk_norm_hf: Any
+    ) -> None:
+        # fold_ln must not touch q_norm/k_norm (they normalise per-head q/k, not the
+        # residual stream) and the logit_scale fold must still be applied once.
+        with torch.no_grad():
+            bridge_lp = torch.log_softmax(qk_norm_bridge_compat(self.TOKENS), dim=-1)
+            hf_lp = torch.log_softmax(qk_norm_hf(self.TOKENS).logits, dim=-1)
+        max_diff = (bridge_lp - hf_lp).abs().max().item()
+        assert max_diff < 1e-3, f"QK-norm compat-mode log-probs diverge from HF: {max_diff:.6f}"
+
+    def test_compat_mode_hf_multiplier_disabled(
+        self, qk_norm_bridge_compat: TransformerBridge
+    ) -> None:
+        assert qk_norm_bridge_compat.original_model.logit_scale == 1.0
