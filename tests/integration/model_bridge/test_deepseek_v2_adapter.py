@@ -101,7 +101,7 @@ class TestDeepSeekV2ForwardPass:
             bridge_out = tiny_deepseek_v2_bridge(tokens)
             hf_out = hf_model(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 0.15, f"Bridge vs HF max diff = {max_diff}"
+        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff}"
 
 
 class TestDeepSeekV2DenseVsMoELayers:
@@ -175,7 +175,7 @@ class TestDeepSeekV2LiteForwardPass:
             bridge_out = tiny_deepseek_v2_lite_bridge(tokens)
             hf_out = hf_model(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 0.15, f"V2-Lite bridge vs HF max diff = {max_diff}"
+        assert max_diff < 1e-4, f"V2-Lite bridge vs HF max diff = {max_diff}"
 
 
 class TestDeepSeekV2LiteNoQLatentHook:
@@ -193,3 +193,29 @@ class TestDeepSeekV2LiteNoQLatentHook:
         _, cache = tiny_deepseek_v2_lite_bridge.run_with_cache(_tokens())
         for i in range(4):
             assert not torch.isnan(cache[f"blocks.{i}.attn.hook_out"]).any()
+
+
+# ---------------------------------------------------------------------------
+# verify_models Phase 1 "all_components": every bridge component must match its
+# HF counterpart on shared random inputs. This is the check that scored 50% on the
+# tiny DeepSeek-V3 registry entries ("2/12 components failed (2 critical)") — the
+# two attention layers, whose reimplemented MLA used rotate-half RoPE on an
+# interleaved checkpoint and ignored HF's YaRN-scaled `scaling`.
+# ---------------------------------------------------------------------------
+
+
+def _assert_all_components_match(bridge: TransformerBridge) -> None:
+    from transformer_lens.benchmarks.component_benchmark import benchmark_all_components
+
+    result = benchmark_all_components(bridge, bridge.original_model)
+    failures = (result.details or {}).get("failures", {})
+    report = "\n".join(f"  {path}: {info}" for path, info in failures.items())
+    assert result.passed, f"{result.message}\n{report}"
+
+
+class TestDeepSeekV2ComponentParity:
+    def test_all_components_match_hf(self, tiny_deepseek_v2_bridge):
+        _assert_all_components_match(tiny_deepseek_v2_bridge)
+
+    def test_all_components_match_hf_lite(self, tiny_deepseek_v2_lite_bridge):
+        _assert_all_components_match(tiny_deepseek_v2_lite_bridge)

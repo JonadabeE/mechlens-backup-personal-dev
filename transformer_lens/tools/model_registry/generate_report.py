@@ -100,7 +100,14 @@ ARCHITECTURE_DESCRIPTIONS: dict[str, str] = {
         "Cohere Command R / R+ (v01, 08-2024) and Aya-23 / Aya Expanse. "
         "Command R7B and Command A are Cohere2ForCausalLM (not yet supported)"
     ),
-    "DeepseekForCausalLM": "DeepSeek's open models",
+    "DeepseekV2ForCausalLM": (
+        "DeepSeek-V2, V2-Lite and DeepSeek-Coder-V2 (MLA attention, MoE). "
+        "V2-Lite has no Q compression (q_lora_rank=None)"
+    ),
+    "DeepseekV3ForCausalLM": (
+        "DeepSeek-V3 and DeepSeek-R1 (MLA attention with interleaved RoPE, YaRN, MoE). "
+        "V3.2 and V4 are separate architectures (not yet supported)"
+    ),
     "InternLMForCausalLM": "Shanghai AI Lab's InternLM",
     "BaichuanForCausalLM": "Baichuan's Chinese-focused models",
     "YiForCausalLM": "01.AI's Yi model series",

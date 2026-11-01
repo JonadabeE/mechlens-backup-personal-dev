@@ -68,14 +68,15 @@ class TestDeepSeekForwardPass:
         assert not torch.isinf(output).any()
 
     def test_forward_matches_hf(self, tiny_deepseek_bridge):
-        """SDPA vs manual matmul — small float32 differences expected."""
+        """fp32 logit parity. The former 0.15 tolerance hid rotate-half RoPE being
+        applied to a rope_interleave=True checkpoint (the DeepseekV3Config default)."""
         tokens = torch.tensor([[1, 2, 3, 4]])
         hf_model = tiny_deepseek_bridge.original_model
         with torch.no_grad():
             bridge_out = tiny_deepseek_bridge(tokens)
             hf_out = hf_model(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 0.15, f"Bridge vs HF max diff = {max_diff}"
+        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff}"
 
 
 class TestDeepSeekDenseVsMoELayers:
@@ -123,3 +124,45 @@ class TestDeepSeekAttentionHooks:
         _, cache = tiny_deepseek_bridge.run_with_cache(tokens)
         assert any("hook_q_latent" in k for k in cache.keys())
         assert any("hook_kv_latent" in k for k in cache.keys())
+
+
+# ---------------------------------------------------------------------------
+# verify_models Phase 1 "all_components": every bridge component must match its
+# HF counterpart on shared random inputs. This is the check that scored 50% on the
+# tiny DeepSeek-V3 registry entries ("2/12 components failed (2 critical)") — the
+# two attention layers, whose reimplemented MLA used rotate-half RoPE on an
+# interleaved checkpoint and ignored HF's YaRN-scaled `scaling`.
+# ---------------------------------------------------------------------------
+
+
+def _assert_all_components_match(bridge: TransformerBridge) -> None:
+    from transformer_lens.benchmarks.component_benchmark import benchmark_all_components
+
+    result = benchmark_all_components(bridge, bridge.original_model)
+    failures = (result.details or {}).get("failures", {})
+    report = "\n".join(f"  {path}: {info}" for path, info in failures.items())
+    assert result.passed, f"{result.message}\n{report}"
+
+
+class TestDeepSeekComponentParity:
+    def test_all_components_match_hf(self, tiny_deepseek_bridge):
+        _assert_all_components_match(tiny_deepseek_bridge)
+
+    def test_attention_components_are_exercised(self, tiny_deepseek_bridge):
+        # Guard against the attention layers being silently skipped by the benchmark
+        # (e.g. via requires_position_embeddings), which would make the test above vacuous.
+        from transformer_lens.benchmarks.component_outputs import ComponentBenchmarker
+
+        hf_model = tiny_deepseek_bridge.original_model
+        tiny_deepseek_bridge.adapter.setup_component_testing(
+            hf_model, bridge_model=tiny_deepseek_bridge
+        )
+        bench = ComponentBenchmarker(
+            bridge_model=tiny_deepseek_bridge,
+            hf_model=tiny_deepseek_bridge.original_model,
+            adapter=tiny_deepseek_bridge.adapter,
+            cfg=tiny_deepseek_bridge.cfg,
+        )
+        report = bench.benchmark_all_components()
+        tested = {r.component_path for r in report.component_results}
+        assert "blocks.0.attn" in tested, f"attention not covered; tested={sorted(tested)}"

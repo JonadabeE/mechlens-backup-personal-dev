@@ -1,6 +1,6 @@
 """Weight processing benchmarks for TransformerBridge."""
 
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 import torch
 
@@ -282,6 +282,43 @@ def benchmark_weight_sharing(
         )
 
 
+def _attention_edit_target(attn: Any) -> tuple[Optional[torch.Tensor], str]:
+    """Return (tensor, label) for an attention weight whose edit must reach the forward pass.
+
+    ``getattr(..., None)`` is enough to probe W_V: bridges without one (MLA) raise an
+    AttributeError-compatible error from ``__getattr__`` rather than a bare
+    NotImplementedError, so the probe degrades to the output projection.
+    """
+    w_v = getattr(attn, "W_V", None)
+    if isinstance(w_v, torch.Tensor):
+        return w_v, "W_V"
+    o_proj = getattr(attn, "o", None)
+    w_o = getattr(o_proj, "weight", None) if o_proj is not None else None
+    if isinstance(w_o, torch.Tensor):
+        return w_o, "o.weight"
+    return None, ""
+
+
+def _mlp_edit_target(mlp: Any) -> tuple[Optional[torch.Tensor], str]:
+    """Return (tensor, label) for an editable MLP weight.
+
+    Dense MLPs expose ``out``; MoE bridges (DeepSeek, Mixtral) do not, so try the
+    shared-expert output projection, then any 2-D parameter under the bridge.
+    """
+    for path in ("out.weight", "shared_experts.out.weight"):
+        obj: Any = mlp
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if isinstance(obj, torch.Tensor):
+            return obj, path
+    for name, param in mlp.named_parameters():
+        if param.ndim == 2:
+            return param, name
+    return None, ""
+
+
 def benchmark_weight_modification(
     bridge: TransformerBridge,
     test_text: str,
@@ -311,23 +348,28 @@ def benchmark_weight_modification(
             )
         _wm_idx, wm_attn_block = wm_attn_blocks[0]
 
-        # Modify W_V weights
+        # Pick an attention weight to edit. W_V for standard attention; architectures
+        # without one (MLA: compressed KV projections) fall back to the output projection.
+        attn_target, attn_label = _attention_edit_target(wm_attn_block.attn)
+        if attn_target is None:
+            return BenchmarkResult(
+                name="weight_modification",
+                severity=BenchmarkSeverity.WARNING,
+                message="No editable attention weight found (neither W_V nor o.weight)",
+                passed=False,
+            )
+        if attn_target.ndim not in (2, 3):
+            return BenchmarkResult(
+                name="weight_modification",
+                severity=BenchmarkSeverity.WARNING,
+                message=f"Unexpected {attn_label} shape: {tuple(attn_target.shape)}",
+                passed=False,
+            )
         with torch.no_grad():
-            original_w_v = wm_attn_block.attn.W_V.clone()
-            # Check dimensionality - GQA models may have 2D tensors instead of 3D
-            if original_w_v.ndim == 3:
-                # Standard 3D tensor: [n_heads, d_model, d_head]
-                wm_attn_block.attn.W_V[0, :, :] = 0
-            elif original_w_v.ndim == 2:
-                # 2D tensor (e.g., GQA models): [n_heads * d_head, d_model] or similar
-                wm_attn_block.attn.W_V[0, :] = 0
-            else:
-                return BenchmarkResult(
-                    name="weight_modification",
-                    severity=BenchmarkSeverity.WARNING,
-                    message=f"Unexpected W_V shape: {original_w_v.shape} (ndim={original_w_v.ndim})",
-                    passed=False,
-                )
+            original_w_v = attn_target.clone()
+            # Zero the first head (3D [n_heads, ...]) or first row (2D); W_V is a view
+            # onto the HF parameter, so the edit reaches the forward pass.
+            attn_target[0] = 0
 
         # Get modified loss (with error handling to restore weights)
         try:
@@ -335,7 +377,7 @@ def benchmark_weight_modification(
         except Exception as forward_error:
             # Restore weights before reporting error
             with torch.no_grad():
-                wm_attn_block.attn.W_V.copy_(original_w_v)
+                attn_target.copy_(original_w_v)
 
             # Some models (e.g., models with complex attention mechanisms) may have
             # forward pass issues after weight modification. Report as skipped.
@@ -348,7 +390,7 @@ def benchmark_weight_modification(
 
         # Restore weights
         with torch.no_grad():
-            wm_attn_block.attn.W_V.copy_(original_w_v)
+            attn_target.copy_(original_w_v)
 
         # Loss should change
         change = abs(modified_loss - original_loss)
@@ -363,19 +405,23 @@ def benchmark_weight_modification(
             try:
                 if mlp_block is None:
                     raise AttributeError("No blocks have mlp submodule")
+                mlp_target, mlp_label = _mlp_edit_target(mlp_block.mlp)
+                if mlp_target is None:
+                    raise AttributeError("No editable MLP weight found")
                 with torch.no_grad():
-                    original_mlp_w = mlp_block.mlp.out.weight.clone()
-                    mlp_block.mlp.out.weight[0, :] = 0
+                    original_mlp_w = mlp_target.clone()
+                    mlp_target[0] = 0
                 mlp_modified_loss = bridge(test_text, return_type="loss")
                 with torch.no_grad():
-                    mlp_block.mlp.out.weight.copy_(original_mlp_w)
+                    mlp_target.copy_(original_mlp_w)
                 mlp_change = abs(mlp_modified_loss - original_loss)
                 if mlp_change > 1e-6:
                     return BenchmarkResult(
                         name="weight_modification",
                         severity=BenchmarkSeverity.INFO,
-                        message=f"Weight modification propagates via MLP (change: {mlp_change:.6f}). "
-                        f"W_V not propagated (combined QKV architecture).",
+                        message=f"Weight modification propagates via MLP {mlp_label} "
+                        f"(change: {mlp_change:.6f}). Attention {attn_label} not propagated "
+                        f"(combined QKV architecture).",
                         details={"change": mlp_change.item(), "fallback": "mlp"},
                     )
             except Exception as mlp_err:

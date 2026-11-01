@@ -47,6 +47,26 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def _apply_rotary_pos_emb_interleave(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Interleaved-pair RoPE, matching HF's ``apply_rotary_pos_emb_interleave``.
+
+    DeepSeek-V3 checkpoints (``rope_interleave=True``, the config default) lay the
+    rotary dims out as pairs ``(x0, x1), (x2, x3), ...`` sharing one frequency, and
+    write the rotated pairs back as ``[real parts || imag parts]``. ``cos``/``sin``
+    arrive as ``cat(freqs, freqs)``; only the first half carries the per-pair angle.
+    """
+    half = cos.shape[-1] // 2
+    cos = cos[..., :half].unsqueeze(1)  # [batch, 1, seq, dim // 2]
+    sin = sin[..., :half].unsqueeze(1)
+    q1, q2 = q[..., 0::2], q[..., 1::2]
+    k1, k2 = k[..., 0::2], k[..., 1::2]
+    q_embed = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+    k_embed = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+    return q_embed, k_embed
+
+
 def _apply_rotary_complex(
     q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -70,6 +90,15 @@ def _apply_rotary_complex(
     q_rot = torch.view_as_real(q_c * freqs.to(q_c.device)).flatten(3).type_as(q)
     k_rot = torch.view_as_real(k_c * freqs.to(k_c.device)).flatten(3).type_as(k)
     return q_rot, k_rot
+
+
+class MLAWeightNotAvailableError(NotImplementedError, AttributeError):
+    """Raised for W_Q/W_K/W_V/W_O/b_* on MLA, which has no standard projections.
+
+    Subclassing AttributeError keeps ``hasattr(attn, "b_V")`` / ``getattr(attn, "W_V",
+    None)`` well-behaved (the verify_models benchmarks and weight processing probe
+    this way), while NotImplementedError preserves the explicit error for direct use.
+    """
 
 
 class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
@@ -112,6 +141,14 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
         # MLA params lazy-initialized from HF module (bridge config lacks these fields)
         self._mla_params_initialized = False
 
+    def _apply_cos_sin_rope(
+        self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch on the checkpoint's rotary layout (V3 ``rope_interleave``)."""
+        if self._rope_interleave:
+            return _apply_rotary_pos_emb_interleave(q, k, cos, sin)
+        return _apply_rotary_pos_emb(q, k, cos, sin)
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Reimplemented MLA forward with hooks at each computation stage.
 
@@ -138,6 +175,9 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
             self._rope_interleave = (
                 getattr(hf_config, "rope_interleave", False) if hf_config else False
             )
+            # HF folds YaRN's mscale**2 into attention.scaling (all released DeepSeek
+            # V2/V3/R1 checkpoints use YaRN); read it rather than recompute 1/sqrt(d).
+            self._scaling = float(getattr(hf_attn, "scaling", None) or self._qk_head_dim ** (-0.5))
             self._mla_params_initialized = True
 
         # --- Extract inputs ---
@@ -211,7 +251,7 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
                 q_rot, k_rot = _apply_rotary_complex(q_rot, k_rot, position_embeddings)
             else:
                 cos, sin = position_embeddings
-                q_rot, k_rot = _apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+                q_rot, k_rot = self._apply_cos_sin_rope(q_rot, k_rot, cos, sin)
         elif self._rotary_emb is not None:
             # Fallback: compute from rotary_emb if position_embeddings not passed
             position_ids = torch.arange(seq_length, device=hidden_states.device).unsqueeze(0)
@@ -220,7 +260,7 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
                 q_rot, k_rot = _apply_rotary_complex(q_rot, k_rot, emb)
             else:
                 cos, sin = emb
-                q_rot, k_rot = _apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+                q_rot, k_rot = self._apply_cos_sin_rope(q_rot, k_rot, cos, sin)
         else:
             raise ValueError(
                 "MLAAttentionBridge requires position_embeddings or set_rotary_emb() "
@@ -255,8 +295,7 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
             )
 
         # --- Attention computation (no V padding — only needed for flash attention) ---
-        scaling = self._qk_head_dim ** (-0.5)
-        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * scaling
+        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * self._scaling
 
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
@@ -328,7 +367,7 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
     def __getattr__(self, name: str) -> Any:
         """Raise clear error for standard weight properties that don't apply to MLA."""
         if name in ("W_Q", "W_K", "W_V", "W_O", "b_Q", "b_K", "b_V", "b_O"):
-            raise NotImplementedError(
+            raise MLAWeightNotAvailableError(
                 f"{name} is not available on MLA (Multi-Head Latent Attention) models. "
                 f"MLA uses compressed projections instead of standard Q/K/V. "
                 f"Access weights via submodules: q_a_proj, q_b_proj, kv_a_proj_with_mqa, "

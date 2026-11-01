@@ -41,8 +41,9 @@ class DeepSeekV3ArchitectureAdapter(ArchitectureAdapter):
         self.cfg.gated_mlp = True
         self.cfg.final_rms = True
         self.cfg.uses_rms_norm = True
-        # HF defaults to SDPA which handles MLA correctly.
-        # HF's eager attention crashes on MLA's asymmetric Q/K dimensions.
+        # Attention is reimplemented in MLAAttentionBridge (reads HF's YaRN-scaled
+        # `scaling` and honours `rope_interleave`); HF's backend choice only affects
+        # the un-bridged reference forward, which the bridge loads as eager.
 
         self.weight_processing_conversions = {}
 
