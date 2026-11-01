@@ -68,14 +68,15 @@ class TestDeepSeekForwardPass:
         assert not torch.isinf(output).any()
 
     def test_forward_matches_hf(self, tiny_deepseek_bridge):
-        """SDPA vs manual matmul — small float32 differences expected."""
+        """fp32 logit parity. The former 0.15 tolerance hid rotate-half RoPE being
+        applied to a rope_interleave=True checkpoint (the DeepseekV3Config default)."""
         tokens = torch.tensor([[1, 2, 3, 4]])
         hf_model = tiny_deepseek_bridge.original_model
         with torch.no_grad():
             bridge_out = tiny_deepseek_bridge(tokens)
             hf_out = hf_model(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 0.15, f"Bridge vs HF max diff = {max_diff}"
+        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff}"
 
 
 class TestDeepSeekDenseVsMoELayers:

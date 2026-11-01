@@ -97,7 +97,14 @@ ARCHITECTURE_DESCRIPTIONS: dict[str, str] = {
     "GitModel": "Microsoft's GIT for vision-language",
     "PaliGemmaForConditionalGeneration": "Google's PaliGemma vision-language",
     "CohereForCausalLM": "Cohere's Command models",
-    "DeepseekForCausalLM": "DeepSeek's open models",
+    "DeepseekV2ForCausalLM": (
+        "DeepSeek-V2, V2-Lite and DeepSeek-Coder-V2 (MLA attention, MoE). "
+        "V2-Lite has no Q compression (q_lora_rank=None)"
+    ),
+    "DeepseekV3ForCausalLM": (
+        "DeepSeek-V3 and DeepSeek-R1 (MLA attention with interleaved RoPE, YaRN, MoE). "
+        "V3.2 and V4 are separate architectures (not yet supported)"
+    ),
     "InternLMForCausalLM": "Shanghai AI Lab's InternLM",
     "BaichuanForCausalLM": "Baichuan's Chinese-focused models",
     "YiForCausalLM": "01.AI's Yi model series",

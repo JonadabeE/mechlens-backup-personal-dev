@@ -101,7 +101,7 @@ class TestDeepSeekV2ForwardPass:
             bridge_out = tiny_deepseek_v2_bridge(tokens)
             hf_out = hf_model(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 0.15, f"Bridge vs HF max diff = {max_diff}"
+        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff}"
 
 
 class TestDeepSeekV2DenseVsMoELayers:
@@ -175,7 +175,7 @@ class TestDeepSeekV2LiteForwardPass:
             bridge_out = tiny_deepseek_v2_lite_bridge(tokens)
             hf_out = hf_model(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 0.15, f"V2-Lite bridge vs HF max diff = {max_diff}"
+        assert max_diff < 1e-4, f"V2-Lite bridge vs HF max diff = {max_diff}"
 
 
 class TestDeepSeekV2LiteNoQLatentHook:
