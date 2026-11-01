@@ -263,3 +263,33 @@ class TestGemma3WeightProcessingConversions:
         # Gemma-3 has bias=None on q/k/v/o_proj — no bias conversion keys expected.
         for key in adapter.weight_processing_conversions:
             assert not key.endswith(".bias"), f"unexpected bias key {key}"
+
+
+class TestGemma3EmbedScaledOnce:
+    """Regression guards for the Gemma embed double-scale bug (upstream #1315).
+
+    transformers >= 4.54 scales embeddings by sqrt(d_model) inside
+    Gemma3TextScaledWordEmbedding.forward, which bridge.embed wraps. Any TL-side
+    scaling on top of that (a weight conversion or a hook_conversion installed from
+    setup_hook_compatibility) doubles it and shifts every logit.
+    """
+
+    @pytest.fixture(scope="class")
+    def adapter(self):
+        return Gemma3ArchitectureAdapter(_make_gemma3_cfg())
+
+    def test_adapter_does_not_override_setup_hook_compatibility(self, adapter):
+        # bridge.py uses hasattr() to decide whether to call the override; absence
+        # is the contract (same guard as test_gemma1/test_gemma2).
+        assert "setup_hook_compatibility" not in vars(type(adapter))
+
+    def test_no_embed_weight_conversion(self, adapter):
+        assert adapter.weight_processing_conversions is not None
+        assert not any(
+            key.startswith("embed.") for key in adapter.weight_processing_conversions
+        ), "embed.weight must stay raw — HF applies sqrt(d_model) at runtime"
+
+    def test_no_preprocess_weights_override(self, adapter):
+        # A preprocess_weights fold of the embed scale would be the other way to
+        # reintroduce the double application.
+        assert "preprocess_weights" not in vars(type(adapter))
