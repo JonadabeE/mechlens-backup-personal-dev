@@ -88,6 +88,17 @@ class TestMLAAttentionBridgeHooks:
         with pytest.raises(NotImplementedError, match="not available on MLA"):
             _ = mla_bridge.W_K
 
+    def test_missing_weights_are_hasattr_safe(self, mla_bridge):
+        # verify_models probes b_V / W_V with hasattr/getattr; a bare NotImplementedError
+        # escaped both and failed value_bias_folding + weight_modification on every
+        # DeepSeek model. The error must also be an AttributeError.
+        # (W_O / b_O resolve through the real `o` submodule and are not probed here.)
+        for name in ("W_Q", "W_K", "W_V", "b_Q", "b_K", "b_V"):
+            assert not hasattr(mla_bridge, name), name
+            assert getattr(mla_bridge, name, None) is None, name
+        with pytest.raises(AttributeError):
+            _ = mla_bridge.b_V
+
 
 class TestMLAAttentionBridgeForward:
     @pytest.fixture

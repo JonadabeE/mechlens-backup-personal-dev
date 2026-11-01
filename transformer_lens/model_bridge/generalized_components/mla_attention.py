@@ -92,6 +92,15 @@ def _apply_rotary_complex(
     return q_rot, k_rot
 
 
+class MLAWeightNotAvailableError(NotImplementedError, AttributeError):
+    """Raised for W_Q/W_K/W_V/W_O/b_* on MLA, which has no standard projections.
+
+    Subclassing AttributeError keeps ``hasattr(attn, "b_V")`` / ``getattr(attn, "W_V",
+    None)`` well-behaved (the verify_models benchmarks and weight processing probe
+    this way), while NotImplementedError preserves the explicit error for direct use.
+    """
+
+
 class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
     """Bridge for DeepSeek's Multi-Head Latent Attention (MLA).
 
@@ -358,7 +367,7 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
     def __getattr__(self, name: str) -> Any:
         """Raise clear error for standard weight properties that don't apply to MLA."""
         if name in ("W_Q", "W_K", "W_V", "W_O", "b_Q", "b_K", "b_V", "b_O"):
-            raise NotImplementedError(
+            raise MLAWeightNotAvailableError(
                 f"{name} is not available on MLA (Multi-Head Latent Attention) models. "
                 f"MLA uses compressed projections instead of standard Q/K/V. "
                 f"Access weights via submodules: q_a_proj, q_b_proj, kv_a_proj_with_mqa, "
