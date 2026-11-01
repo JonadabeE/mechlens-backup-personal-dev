@@ -103,11 +103,12 @@ HF raw config attributes are invisible to TL-side consumers unless propagated to
 
 | HF attribute | Fold target | Used by |
 |---|---|---|
-| `logit_scale` | `unembed.weight` (multiply in fp32 then cast back) | Cohere — final logits scaled by `1/16` |
-| `embedding_multiplier` / embed-scale flags | `embed.weight` (multiply) | Gemma — embeddings scaled by `√d_model` |
+| `logit_scale` | `unembed.weight` (multiply in fp32 then cast back) **and** set the HF module's runtime `logit_scale` to `1.0` | Cohere — final logits scaled by `1/16` |
 | Tied unembed with extra scale | `unembed.weight` | T5-family tied projection variants |
 
-Rule of thumb: if the model card or HF source mentions a numerical knob, assume it needs to land on `self.cfg`. If that knob changes weights or final outputs and HF's forward applies it natively, you ALSO need a `preprocess_weights` override or compatibility mode will diverge.
+**Not folded** (HF applies it at runtime inside a module the bridge wraps, so the hook already sees the scaled value): Gemma's `√d_model` embedding scale lives in `GemmaTextScaledWordEmbedding.forward`; `gemma1.py` deliberately leaves `embed.weight` raw.
+
+Rule of thumb: if the model card or HF source mentions a numerical knob, assume it needs to land on `self.cfg`. If that knob changes weights or final outputs and HF's forward applies it natively, decide where it is applied **exactly once**: either leave it to HF at runtime (no fold), or fold it into the weight AND switch off HF's runtime application. The Bridge always forwards through the HF model, so a fold on its own double-applies the op after `process_weights()`.
 
 **Passthrough gotcha:** if your attr is NOT a declared `TransformerBridgeConfig` field, `TransformerBridgeConfig.from_dict(hf_config)` silently filters it out — `getattr(cfg, "<attr>", None)` in your adapter will return `None` and your fallback default fires regardless of the model's actual value. To propagate, add the attr name to `_HF_PASSTHROUGH_ATTRS` in [`sources/transformers.py`](../sources/transformers.py) (and the duplicate list in [`sources/_bridge_builder.py`](../sources/_bridge_builder.py)). Verify with an integration-test assertion: `assert bridge.cfg.<attr> == hf_model.config.<attr>`.
 
@@ -117,12 +118,14 @@ Rule of thumb: if the model card or HF source mentions a numerical knob, assume 
 
 Default is a no-op pass-through. Override when a numerical op HF applies natively in forward must also be baked into raw weights — otherwise `bridge.enable_compatibility_mode()` (which calls `process_weights` expecting the math to already be in the weights) diverges.
 
-> **Trigger:** if a config attr changes the forward-pass math AND isn't re-applied by compat-mode weight processing, fold it into the relevant weight in `preprocess_weights()`.
+> **Trigger:** if a config attr changes the forward-pass math AND the TL-facing weight (`W_U`, `W_E`, …) must carry it for HookedTransformer-equivalent analyses (logit lens, DLA), fold it into that weight in `preprocess_weights()` — and neutralise HF's own runtime application of it, because `TransformerBridge.forward` still dispatches through the HF model after processing.
 
 Examples:
 
-- **Cohere** — `cfg.logit_scale` (default `0.0625`) folds into `unembed.weight`. HF forward multiplies logits by `logit_scale`; compat-mode doesn't.
-- **Gemma1/2/3** — embedding scale (`√d_model`) folds into `embed.weight`. HF's `GemmaTextScaledWordEmbedding` scales on forward; compat-mode reads raw.
+- **Cohere** — `cfg.logit_scale` (default `0.0625`) folds into `unembed.weight`, then `preprocess_weights` sets `hf_model.logit_scale = 1.0` (the adapter keeps the HF model from `prepare_model`). Skipping the second step scaled compat-mode logits by `logit_scale²` and degraded `verify_models` Phase 3 for every Cohere model.
+- **Gemma1/2/3** — the `√d_model` embedding scale is applied by `GemmaTextScaledWordEmbedding.forward`, which `bridge.embed` wraps, so `embed.hook_out` already captures the scaled value. No fold; see the comment in `gemma1.py`.
+
+Make the fold idempotent (`enable_compatibility_mode()` after an explicit `process_weights()` re-enters `preprocess_weights` on already-scaled weights), and cover it with three tests: unit (fake HF module), processed-bridge forward == HF, and compat-mode log-probs == HF.
 
 Skeleton:
 

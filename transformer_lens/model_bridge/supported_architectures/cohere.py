@@ -1,6 +1,11 @@
 """Cohere architecture adapter.
 
-Supports CohereForCausalLM models (Command-R family) with:
+Supports CohereForCausalLM — Command R / R+ (v01 and 08-2024), Aya-23 and
+Aya Expanse. Command R7B, Command A and the tiny-aya models are
+Cohere2ForCausalLM (sliding-window/global ``layer_types``), which is a
+separate architecture and not covered here.
+
+Architectural features handled:
 - Parallel attention+MLP sharing a single input_layernorm (no post_attention_layernorm)
 - True LayerNorm (CohereLayerNorm) with weight but no bias
 - GQA (grouped-query attention) with separate Q/K/V/O projections

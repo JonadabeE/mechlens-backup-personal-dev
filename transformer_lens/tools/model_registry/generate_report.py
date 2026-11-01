@@ -96,7 +96,10 @@ ARCHITECTURE_DESCRIPTIONS: dict[str, str] = {
     "LlavaForConditionalGeneration": "Visual instruction-tuned LLaMA",
     "GitModel": "Microsoft's GIT for vision-language",
     "PaliGemmaForConditionalGeneration": "Google's PaliGemma vision-language",
-    "CohereForCausalLM": "Cohere's Command models",
+    "CohereForCausalLM": (
+        "Cohere Command R / R+ (v01, 08-2024) and Aya-23 / Aya Expanse. "
+        "Command R7B and Command A are Cohere2ForCausalLM (not yet supported)"
+    ),
     "DeepseekForCausalLM": "DeepSeek's open models",
     "InternLMForCausalLM": "Shanghai AI Lab's InternLM",
     "BaichuanForCausalLM": "Baichuan's Chinese-focused models",
