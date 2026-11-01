@@ -139,3 +139,58 @@ class TestGemma3ComponentParity:
         failures = (result.details or {}).get("failures", {})
         report = "\n".join(f"  {path}: {info}" for path, info in failures.items())
         assert result.passed, f"{result.message}\n{report}"
+
+
+class TestGemma3NormEpsPlacement:
+    """Project-notes regression (internal v2.16.1 hotfix, #1121): Gemma-3 RMSNorm
+    epsilon must sit inside the rsqrt, ``x * rsqrt(mean(x^2) + eps)``, not outside.
+
+    On ordinary activations the two placements agree to ~1e-6 and a logit-parity
+    test cannot tell them apart. On near-zero input (variance << eps) eps dominates
+    and the placements differ by orders of magnitude, so this input isolates it.
+    """
+
+    def _eps_dominated_input(self, bridge: TransformerBridge) -> torch.Tensor:
+        torch.manual_seed(1)
+        # variance ~ 1e-10 vs rms_norm_eps 1e-6: eps placement decides the output.
+        return torch.randn(1, 4, bridge.cfg.d_model) * 1e-5
+
+    def test_cfg_eps_matches_hf(self, gemma3_pair) -> None:
+        bridge, hf_ref = gemma3_pair
+        assert bridge.cfg.eps == pytest.approx(hf_ref.config.rms_norm_eps)
+        assert bridge.blocks[0].ln1.original_component.eps == pytest.approx(
+            hf_ref.config.rms_norm_eps
+        )
+
+    @pytest.mark.parametrize("norm_path", ["blocks.0.ln1", "blocks.0.ln2", "ln_final"])
+    def test_norm_matches_hf_when_eps_dominates(self, gemma3_pair, norm_path: str) -> None:
+        bridge, hf_ref = gemma3_pair
+        x = self._eps_dominated_input(bridge)
+        bridge_norm: torch.nn.Module = bridge
+        for part in norm_path.split("."):
+            bridge_norm = getattr(bridge_norm, part)
+        hf_norm = bridge_norm.original_component
+        with torch.no_grad():
+            bridge_out = bridge_norm(x)
+            hf_out = hf_norm(x)
+            # The wrong placement, for reference: x * rsqrt(var) + eps-ish terms blow
+            # up when var << eps; make sure the bridge is not on that curve.
+            wrong = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True)) * (1.0 + hf_norm.weight)
+        assert torch.allclose(bridge_out, hf_out, atol=1e-6), f"{norm_path} eps placement"
+        assert not torch.allclose(bridge_out, wrong, atol=1e-3)
+
+    def test_hook_scale_includes_eps(self, gemma3_pair) -> None:
+        # hook_scale is sqrt(var + eps): with var << eps it must be ~sqrt(eps), not ~0.
+        bridge, hf_ref = gemma3_pair
+        x = self._eps_dominated_input(bridge)
+        captured = {}
+        handle = bridge.blocks[0].ln1.hook_scale.register_forward_hook(
+            lambda m, i, o: captured.__setitem__("scale", o.detach().clone())
+        )
+        try:
+            with torch.no_grad():
+                bridge.blocks[0].ln1(x)
+        finally:
+            handle.remove()
+        expected = (x.pow(2).mean(-1, keepdim=True) + hf_ref.config.rms_norm_eps).sqrt()
+        assert torch.allclose(captured["scale"], expected, rtol=1e-4)
